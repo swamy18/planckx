@@ -1,15 +1,31 @@
 <pre>
-██████╗ ██╗      █████╗ ███╗   ██╗ ██████╗██╗  ██╗       ██╗  ██╗
-██╔══██╗██║     ██╔══██╗████╗  ██║██╔════╝██║ ██╔╝       ╚██╗██╔╝
-██████╔╝██║     ███████║██╔██╗ ██║██║     █████╔╝  █████╗ ╚███╔╝ 
-██╔═══╝ ██║     ██╔══██║██║╚██╗██║██║     ██╔═██╗  ╚════╝ ██╔██╗ 
-██║     ███████╗██║  ██║██║ ╚████║╚██████╗██║  ██╗       ██╔╝ ██╗
-╚═╝     ╚══════╝╚═╝  ╚═╝╚═╝  ╚═══╝ ╚═════╝╚═╝  ╚═╝       ╚═╝  ╚═╝
+       ___  __    ___   _  _  ___  _  __       __  __
+      / _ \/ /   / _ | / |/ // _/ | |/ / ____  \ \/ /
+     / ___/ /__ / __ |/    // /_  |   / /___/   >  < 
+    /_/  /____//_/ |_/_/|_/ \__/  |__/         /_/\_\
+    
+           C H R O N O S - B I T   E N G I N E
 </pre>
 
 # PLANCK-X: Chronos-Bit Engine (v3.1-Adaptive)
 
 An authoritative, high-fidelity, entropy-aware inference engine. PLANCK-X utilizes dynamic bit-shifting to maintain Claude-level nuance while systematically optimizing raw compute.
+
+## Quick Start
+
+### Installation
+Clone the repository and install the required dependencies:
+```bash
+git clone https://github.com/yourusername/planck-x.git
+cd planck-x
+pip install -r requirements.txt
+```
+
+### How to Run
+Execute the end-to-end pipeline. This will train a `PlanckXLayer` from scratch, apply Quantisation-Aware Fine-Tuning (QAFT), and run the autoregressive B-PACS benchmarks:
+```bash
+python run_demo.py
+```
 
 ## 1. The Problem Statement: Static Inference is Dead
 
@@ -40,6 +56,8 @@ We enforce an aggressive 90/10 split: 90% of the network layers are aggressively
 ### Nuance-Gate: Beyond Simple Entropy
 Shannon Entropy alone is a blunt instrument. A token might have low overall entropy but represent a critical linguistic bifurcation. 
 The **Nuance-Gate** measures the **Variance** of the top-5 logits. If the variance is extremely high—indicating the model sees a sharp, distinct choice between multiple highly plausible, nuanced words—the token is **forced** through Path 5 (Full Precision). Variance prevents poetic, complex, or domain-specific language from being flattened by bit-shifted shortcuts.
+
+> **Note:** The threshold $\tau_{nuance}$ is dynamically tunable, allowing developers to smoothly dial in the required trade-off between strict mathematical precision and raw inference speed.
 
 ### Nonsense Prevention Framework
 A strict KL-Divergence Teacher-Student training loop is employed. The quantized student model is penalized aggressively via KL-Divergence against a full float32 teacher. This guarantees that the aggressive bit-shifting paths never degrade output into localized nonsense.
@@ -80,6 +98,7 @@ If `\sigma^2 > \tau_{nuance}`, route to Path 5.
 planck/
 ├── README.md              # Central documentation and architectural specs
 ├── run_demo.py            # End-to-end execution pipeline
+├── requirements.txt       # Dependencies
 └── planckx/
     ├── __init__.py        
     ├── adapter.py         # 90/10 Hybrid Precision & QAFT implementation
@@ -93,3 +112,18 @@ planck/
 - **Multi-GPU Support:** Tensor parallelism for the Nuance-Gate to distribute the top-K variance load across multiple devices seamlessly.
 - **LLaMA-3 Native Quantization:** Porting the Tri-Path router to standard transformer block structures like Llama-3 and Mistral architectures.
 - **FP8/INT4 Mixed-Precision:** Advancing the 90/10 split to leverage native hardware FP8 cores alongside INT4 paths.
+
+## Citation
+
+If you use PLANCK-X in your research or production pipelines, please cite it as follows:
+
+```bibtex
+@misc{planckx2026,
+  author = {PLANCK-X Contributors},
+  title = {PLANCK-X: Chronos-Bit Engine (v3.1-Adaptive)},
+  year = {2026},
+  publisher = {GitHub},
+  journal = {GitHub repository},
+  howpublished = {\url{https://github.com/yourusername/planck-x}}
+}
+```
