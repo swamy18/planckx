@@ -32,7 +32,7 @@ class PlanckXLayer(nn.Module):
     NUANCE_VARIANCE_THRESHOLD: float = 0.5  # Threshold for top-5 logit variance
     EPS: float = 1e-9
 
-    def __init__(self, d_model: int = 64, vocab_size: int = 23):
+    def __init__(self, d_model: int = 64, vocab_size: int = 32000):
         super().__init__()
         self.d_model = d_model
         self.vocab_size = vocab_size
@@ -148,12 +148,20 @@ class PlanckXLayer(nn.Module):
             # is high (indicating a nuanced word choice), FORCE the token
             # through Path 5.
             with torch.no_grad():
+                import time
+                _start_time = time.perf_counter()
+
                 # Get top-5 logits and their variance
                 top5_logits, _ = torch.topk(entropy_logits, k=min(5, entropy_logits.size(-1)), dim=-1)
                 # Calculate variance of top-5 logits for each token
                 top5_variance = torch.var(top5_logits, dim=-1, unbiased=False)  # [flat_dim]
                 # Create nuance mask: high variance indicates nuanced choice
                 nuance_mask = top5_variance > self.NUANCE_VARIANCE_THRESHOLD
+                
+                # Stress Test Verification: Check if Nuance-Gate latency is under 1ms
+                _latency_ms = (time.perf_counter() - _start_time) * 1000.0
+                if _latency_ms > 1.0:
+                    print(f"[SCALABILITY WARNING] Nuance-Gate variance calculation latency exceeded 1ms: {_latency_ms:.3f}ms")
         else:
             # Fallback: estimate from raw X_flat statistics if no logits
             # were provided (should not happen in normal usage)
