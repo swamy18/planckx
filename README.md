@@ -47,13 +47,17 @@ A strict KL-Divergence Teacher-Student training loop is employed. The quantized 
 ## 4. Mathematical Foundation
 
 **Shannon Entropy Routing Gate:**
-$$ H(X) = - \sum_{i=1}^{V} p_i \log_2(p_i + \epsilon) $$
-Where $p_i = \text{Softmax}(x_i)$ over vocabulary $V$.
+```math
+H(X) = - \sum_{i=1}^{V} p_i \log_2(p_i + \epsilon)
+```
+Where `p_i = Softmax(x_i)` over vocabulary `V`.
 
 **Nuance-Gate Variance Thresholding:**
-Given the top-$K$ logits $\mathbf{z}_{topK}$, the variance is computed as:
-$$ \sigma^2 = \frac{1}{K} \sum_{k=1}^{K} (z_k - \mu)^2 $$
-If $\sigma^2 > \tau_{nuance}$, route to Path 5.
+Given the top-K logits `z_{topK}`, the variance is computed as:
+```math
+\sigma^2 = \frac{1}{K} \sum_{k=1}^{K} (z_k - \mu)^2
+```
+If `\sigma^2 > \tau_{nuance}`, route to Path 5.
 
 ## 5. Comprehensive Benchmarks
 
