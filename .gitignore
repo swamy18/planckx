@@ -1,0 +1,46 @@
+# ─── Python ──────────────────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg
+*.egg-info/
+dist/
+build/
+eggs/
+MANIFEST
+
+# ─── Virtual environments ────────────────────────────────────────────────────
+.venv/
+venv/
+ENV/
+env/
+
+# ─── IDE / Editor ─────────────────────────────────────────────────────────────
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# ─── Logs & Checkpoints ───────────────────────────────────────────────────────
+*.log
+*.out
+run_logs/
+checkpoints/
+*.pt
+*.pth
+*.pkl
+
+# ─── OS ───────────────────────────────────────────────────────────────────────
+Thumbs.db
+desktop.ini
+
+# ─── Test / Coverage artefacts ─────────────────────────────────────────────────
+.pytest_cache/
+.coverage
+htmlcov/
+.tox/
+.nox/
+site-packages/
