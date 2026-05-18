@@ -119,7 +119,6 @@ planck/
 ## 8. Future Roadmap
 
 - **Multi-GPU Support:** Tensor parallelism for the Nuance-Gate to distribute the top-K variance load across multiple devices seamlessly.
-- **LLaMA-3 Native Quantization:** Porting the Tri-Path router to standard transformer block structures like Llama-3 and Mistral architectures.
 - **FP8/INT4 Mixed-Precision:** Advancing the 90/10 split to leverage native hardware FP8 cores alongside INT4 paths.
 
 ## Citation
