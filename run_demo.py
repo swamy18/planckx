@@ -7,7 +7,7 @@ Three-step execution pipeline:
   Step 2 — Quantise a dense reference model with PlanckXAdapter (90/10 ternary)
            and run QAFT fine-tuning.
   Step 3 — Run PlanckXEngine autoregressive generation and print the full
-           evaluation matrix (Loss, Entropy, Path %, Avg Nominal Stages).
+           evaluation matrix (Loss, Entropy, Path %, Avg Nominal Stages, Nuance & Consistency Score).
 """
 
 import math
@@ -260,6 +260,123 @@ def compute_output_entropy(model: nn.Module, dataset: torch.Tensor) -> float:
     return float(entropy_per_token.mean().item())
 
 
+@torch.no_grad()
+def compute_perplexity(model: nn.Module, dataset: torch.Tensor) -> float:
+    """
+    Compute perplexity of the model on the dataset.
+    Perplexity = exp(average cross-entropy loss)
+    Lower perplexity indicates better performance (less "nonsense").
+    """
+    model.eval()
+    criterion = nn.CrossEntropyLoss()
+    inputs = dataset[:, :-1]
+    targets = dataset[:, 1:]
+    logits = model(inputs)
+    flat_logits = logits.reshape(-1, logits.shape[-1])
+    flat_targets = targets.reshape(-1)
+    
+    # Cross entropy loss
+    loss = criterion(flat_logits, flat_targets)
+    # Perplexity = exp(loss)
+    perplexity = torch.exp(loss)
+    return float(perplexity.item())
+
+
+@torch.no_grad()
+def compute_nuance_consistency_score(model: PlanckXCharModel, dataset: torch.Tensor) -> float:
+    """
+    Compute a 'Nuance & Consistency Score' by testing on a complex string.
+    The score measures how well the model distinguishes between:
+    - Obvious repetition (should use Path 1 - 1-stage bit-shift)
+    - Complex/nuanced language (should use Path 5 - full precision)
+    
+    Returns a score between 0 and 1, where higher is better.
+    """
+    model.eval()
+    
+    # Create a test complex string with varied punctuation and case
+    # Using characters from our vocabulary but arranging them in a complex pattern
+    complex_chars = ['h', 'e', 'l', 'l', 'o', ',', ' ', 'w', 'o', 'r', 'l', 'd', '!']
+    # Filter to only include chars in our vocabulary
+    vocab_chars = set(CHAR_SET)
+    filtered_chars = [c for c in complex_chars if c in vocab_chars]
+    
+    # If we don't have enough chars, create a pattern from available ones
+    if len(filtered_chars) < 4:
+        # Use first few available chars to create a repeating pattern
+        base_chars = list(vocab_chars)[:4] if len(vocab_chars) >= 4 else list(vocab_chars)
+        # Create a complex pattern: abcdefgh... but with variations
+        pattern = ""
+        for i in range(20):  # Make it 20 chars long
+            pattern += base_chars[i % len(base_chars)]
+        # Add some punctuation-like variation by changing case (though we don't have case in our vocab)
+        # Instead, we'll insert spaces and other available chars periodically
+        complex_string = ""
+        for i, char in enumerate(pattern):
+            complex_string += char
+            # Periodically insert a different available char for variety
+            if (i + 1) % 5 == 0 and len(vocab_chars) > 1:
+                # Insert a different char from vocab
+                other_chars = [c for c in vocab_chars if c != char]
+                if other_chars:
+                    complex_string += other_chars[0]
+    else:
+        # Use the filtered chars to create our complex string
+        complex_string = "".join(filtered_chars) * 3  # Repeat to make it longer
+    
+    # Convert string to tensor indices
+    try:
+        complex_indices = [CHAR_TO_IDX[ch] for ch in complex_string if ch in CHAR_TO_IDX]
+        if not complex_indices:
+            # Fallback: use a simple repetitive string
+            complex_indices = [CHAR_TO_IDX['a']] * 10
+        complex_tensor = torch.tensor(complex_indices, dtype=torch.long).unsqueeze(0)  # [1, seq_len]
+    except KeyError:
+        # Fallback if any char not in vocab
+        complex_tensor = torch.tensor([CHAR_TO_IDX['a']] * 10, dtype=torch.long).unsqueeze(0)
+    
+    # We need to compare against a simple repetitive string for obvious repetition
+    simple_char = CHAR_SET[0]  # 'a'
+    simple_string = simple_char * max(10, len(complex_string))
+    simple_indices = [CHAR_TO_IDX[simple_char]] * len(simple_string)
+    simple_tensor = torch.tensor(simple_indices, dtype=torch.long).unsqueeze(0)  # [1, seq_len]
+    
+    # Reset counters before testing
+    model.reset_counters()
+    
+    # Test on complex string
+    with torch.no_grad():
+        # Forward pass to get routing information
+        _ = model(complex_tensor)
+    
+    complex_util = model.get_utilization_rates()
+    complex_p1 = complex_util["path_1_pct"]
+    complex_p5 = complex_util["path_5_pct"]
+    
+    # Reset counters again
+    model.reset_counters()
+    
+    # Test on simple repetitive string
+    with torch.no_grad():
+        _ = model(simple_tensor)
+    
+    simple_util = model.get_utilization_rates()
+    simple_p1 = simple_util["path_1_pct"]
+    simple_p5 = simple_util["path_5_pct"]
+    
+    # Nuance & Consistency Score:
+    # For complex string: we want HIGH Path 5 usage (nuanced language handled with full precision)
+    # For simple string: we want HIGH Path 1 usage (obvious repetition handled with bit-shift)
+    # Score = (complex_path_5_pct + simple_path_1_pct) / 200  (normalized to 0-1)
+    # But we need to handle case where percentages might be 0
+    score = (complex_p5 + simple_p1) / 200.0
+    
+    # Ensure score is between 0 and 1
+    score = max(0.0, min(1.0, score))
+    
+    return score
+
+
 def step_3_generate_and_evaluate(
     trained_model: PlanckXCharModel,
     dataset: torch.Tensor,
@@ -324,11 +441,15 @@ def step_3_generate_and_evaluate(
         targets_eval.reshape(-1),
     ).item())
     output_entropy = compute_output_entropy(trained_model, dataset)
+    perplexity = compute_perplexity(trained_model, dataset)
+    nuance_consistency_score = compute_nuance_consistency_score(trained_model, dataset)
     util = trained_model.plankx_layer.get_utilization_rates()
 
     matrix = {
         "loss": final_loss,
         "output_entropy": output_entropy,
+        "perplexity": perplexity,
+        "nuance_consistency_score": nuance_consistency_score,
         "path_1_pct": util["path_1_pct"],
         "path_2_pct": util["path_2_pct"],
         "path_5_pct": util["path_5_pct"],
@@ -350,6 +471,8 @@ def print_markdown_matrix(matrix: dict) -> None:
         "|---------------------------|------------------------|",
         f"| Loss                      | {matrix['loss']:.4f}           |",
         f"| Output Entropy            | {matrix['output_entropy']:.4f}           |",
+        f"| Perplexity                | {matrix['perplexity']:.4f}           |",
+        f"| Nuance & Consistency Score| {matrix['nuance_consistency_score']:.4f}           |",
         f"| Path 1 % (H < 4.0)        |  {matrix['path_1_pct']:.2f} %         |",
         f"| Path 2 % (4.0 <= H < 4.5) |  {matrix['path_2_pct']:.2f} %         |",
         f"| Path 5 % (H >= 4.5)       |  {matrix['path_5_pct']:.2f} %         |",
