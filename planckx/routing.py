@@ -18,12 +18,18 @@ class PlanckXLayer(nn.Module):
     Category B (Path 2): 4.0 <= H < 4.5  -> (X >> 2) + (X >> 4)
     Category C (Path 5): H >= 4.5  -> 5-layer nn.Sequential
 
+    Nuance-Gate: Even if Entropy is low, if the 'Variance' of the top-5 logits
+    is high (indicating a nuanced word choice), FORCE the token through Path 5.
+    This ensures that poetic or complex language never gets "flattened" by
+    the 1-stage bit-shift path.
+
     All branches are evaluated in parallel; torch.where selects per token.
     """
 
     # --- Dynamic thresholds (relaxed from v1) ---------------------------
     THRESH_PATH2: float = 4.0    # Path 1 fires when H < 4.0
     THRESH_PATH5: float = 4.5    # Path 5 fires when H >= 4.5; else Path 2
+    NUANCE_VARIANCE_THRESHOLD: float = 0.5  # Threshold for top-5 logit variance
     EPS: float = 1e-9
 
     def __init__(self, d_model: int = 64, vocab_size: int = 23):
@@ -114,11 +120,11 @@ class PlanckXLayer(nn.Module):
         ----------
         X              : [batch, seq, d_model] embedded token activations.
         entropy_logits : [batch * seq, vocab_size] FINAL output logits from
-                         the model's output_projection.  Used to compute
-                         the Shannon-Entropy routing gate so gradients flow
-                         through the exact same head that produces the CE
-                         loss.  Pass None to fall back on a per-sample
-                         uniform baseline.
+                          the model's output_projection.  Used to compute
+                          the Shannon-Entropy routing gate so gradients flow
+                          through the exact same head that produces the CE
+                          loss.  Pass None to fall back on a per-sample
+                          uniform baseline.
 
         Returns
         -------
@@ -137,6 +143,17 @@ class PlanckXLayer(nn.Module):
         # optimizer updates for the CE loss.
         if entropy_logits is not None:
             entropy = self._compute_shannon_entropy(entropy_logits)
+            # ---- Nuance-Gate: Check variance of top-5 logits -----------
+            # Even if Entropy is low, if the 'Variance' of the top-5 logits
+            # is high (indicating a nuanced word choice), FORCE the token
+            # through Path 5.
+            with torch.no_grad():
+                # Get top-5 logits and their variance
+                top5_logits, _ = torch.topk(entropy_logits, k=min(5, entropy_logits.size(-1)), dim=-1)
+                # Calculate variance of top-5 logits for each token
+                top5_variance = torch.var(top5_logits, dim=-1, unbiased=False)  # [flat_dim]
+                # Create nuance mask: high variance indicates nuanced choice
+                nuance_mask = top5_variance > self.NUANCE_VARIANCE_THRESHOLD
         else:
             # Fallback: estimate from raw X_flat statistics if no logits
             # were provided (should not happen in normal usage)
@@ -146,15 +163,16 @@ class PlanckXLayer(nn.Module):
             entropy = -torch.sum(
                 F.softmax(X_flat, dim=-1) * log_probs, dim=-1
             )
+            nuance_mask = torch.zeros(flat_dim, dtype=torch.bool, device=X.device)
         # entropy shape: [flat_dim]
 
         # ---- Boolean masks — relaxed thresholds -----------------------
         # Path 1: H < 4.0   (was 3.8)
         # Path 2: 4.0 <= H < 4.5
-        # Path 5: H >= 4.5
+        # Path 5: H >= 4.5 OR nuance_mask is True (Nuance-Gate)
         mask_a = entropy < self.THRESH_PATH2          # [N]
         mask_b = (~mask_a) & (entropy < self.THRESH_PATH5)   # [N]
-        mask_c = entropy >= self.THRESH_PATH5         # [N]
+        mask_c = (entropy >= self.THRESH_PATH5) | nuance_mask   # [N]
 
         # ---- Update utilisation counters from this forward pass's masks
         n_a = int(mask_a.sum().item())
