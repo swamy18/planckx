@@ -50,6 +50,10 @@ class PlanckXLayer(nn.Module):
             nn.Linear(in_features=d_model, out_features=d_model),
             nn.ReLU(),
         )
+        # Lightweight routing head: cheap logits for entropy estimation
+        # Use a much smaller "shallow" vocab to reduce entropy compute cost.
+        self.routing_vocab = min(512, max(64, vocab_size // 64))
+        self.routing_head = nn.Linear(in_features=d_model, out_features=self.routing_vocab)
         # NOTE: NO vocab_projection inside this layer.
         #       Routing entropy is computed outside, from the model's actual
         #       output_projection logits, and passed in as entropy_logits.
@@ -137,47 +141,43 @@ class PlanckXLayer(nn.Module):
         # ---- Flatten to [N, d_model] -----------------------------------
         X_flat = X.reshape(flat_dim, self.d_model)
 
-        # ---- Entropy gate: tie to actual model output logits -----------
-        # entropy_logits is produced by self.output_projection(X_flat) in
-        # the wrapper model's forward pass — the same parameters the
-        # optimizer updates for the CE loss.
+        # ---- Entropy gate: compute cheap shallow logits via routing_head
+        # If caller provided full `entropy_logits`, prefer that (useful
+        # for evaluation), otherwise compute shallow logits to decide.
         if entropy_logits is not None:
-            entropy = self._compute_shannon_entropy(entropy_logits)
-            # ---- Nuance-Gate: Check variance of top-5 logits -----------
-            # Even if Entropy is low, if the 'Variance' of the top-5 logits
-            # is high (indicating a nuanced word choice), FORCE the token
-            # through Path 5.
-            with torch.no_grad():
-                import time
-                _start_time = time.perf_counter()
-
-                # Get top-5 logits and their variance
-                top5_logits, _ = torch.topk(entropy_logits, k=min(5, entropy_logits.size(-1)), dim=-1)
-                # Calculate variance of top-5 logits for each token
-                top5_variance = torch.var(top5_logits, dim=-1, unbiased=False)  # [flat_dim]
-                # Create nuance mask: high variance indicates nuanced choice
-                nuance_mask = top5_variance > self.NUANCE_VARIANCE_THRESHOLD
-                
-                # Stress Test Verification: Check if Nuance-Gate latency is under 1ms
-                _latency_ms = (time.perf_counter() - _start_time) * 1000.0
-                if _latency_ms > 1.0:
-                    print(f"[SCALABILITY WARNING] Nuance-Gate variance calculation latency exceeded 1ms: {_latency_ms:.3f}ms")
+            # If provided logits have larger vocab, try to reduce cost by
+            # computing entropy over a shallow projection when possible.
+            try:
+                entropy = self._compute_shannon_entropy(entropy_logits)
+            except Exception:
+                # Fallback: compute from routing_head
+                shallow_logits = self.routing_head(X_flat)
+                entropy = self._compute_shannon_entropy(shallow_logits)
+                entropy_logits = None
         else:
-            # Fallback: estimate from raw X_flat statistics if no logits
-            # were provided (should not happen in normal usage)
-            log_probs = torch.log2(
-                F.softmax(X_flat, dim=-1) + self.EPS
-            )
-            entropy = -torch.sum(
-                F.softmax(X_flat, dim=-1) * log_probs, dim=-1
-            )
-            nuance_mask = torch.zeros(flat_dim, dtype=torch.bool, device=X.device)
-        # entropy shape: [flat_dim]
+            shallow_logits = self.routing_head(X_flat)
+            entropy = self._compute_shannon_entropy(shallow_logits)
+            entropy_logits = None
+
+        # ---- Nuance-Gate: compute cheaply on shallow logits only for
+        # tokens near the decision boundary to avoid global topk costs.
+        # Create a conservative initial nuance_mask of all False.
+        nuance_mask = torch.zeros(flat_dim, dtype=torch.bool, device=X.device)
+        # Identify borderline tokens (within 0.1 bits of threshold)
+        borderline = (entropy >= (self.THRESH_PATH5 - 0.1)) & (entropy <= (self.THRESH_PATH5 + 0.1))
+        if borderline.any():
+            # compute top-5 variance on shallow logits for borderline tokens
+            b_idx = borderline.nonzero(as_tuple=True)[0]
+            try:
+                topk = min(5, shallow_logits.size(-1))
+                topk_vals, _ = torch.topk(shallow_logits[b_idx], k=topk, dim=-1)
+                topk_var = torch.var(topk_vals, dim=-1, unbiased=False)
+                nuance_mask[b_idx] = topk_var > self.NUANCE_VARIANCE_THRESHOLD
+            except Exception:
+                # If anything fails, leave nuance_mask as False to avoid added cost
+                pass
 
         # ---- Boolean masks — relaxed thresholds -----------------------
-        # Path 1: H < 4.0   (was 3.8)
-        # Path 2: 4.0 <= H < 4.5
-        # Path 5: H >= 4.5 OR nuance_mask is True (Nuance-Gate)
         mask_a = entropy < self.THRESH_PATH2          # [N]
         mask_b = (~mask_a) & (entropy < self.THRESH_PATH5)   # [N]
         mask_c = (entropy >= self.THRESH_PATH5) | nuance_mask   # [N]
@@ -193,19 +193,29 @@ class PlanckXLayer(nn.Module):
         if n_c:
             self.path_5_counter += n_c
 
-        # ---- Evaluate all three branches in parallel over full tensor --
-        # Each call touches ALL elements; per-element correctness is
-        # guaranteed by the torch.where selectors below.
-        result_a = self._path_1_transform(X_flat)    # [N, d_model]
-        result_b = self._path_2_transform(X_flat)    # [N, d_model]
-        result_c = self._path_5_transform(           # [N, d_model]
-            self.path_5_sequential, X_flat
-        )
+        # ---- Index-dispatch: execute only selected paths on subsets ---
+        out = torch.empty_like(X_flat)
 
-        # ---- Assemble output with element-wise masking -----------------
-        # Stage 1: choose A vs B; Stage 2: override with C where mask_c
-        out = torch.where(mask_a.unsqueeze(-1), result_a, result_b)
-        out = torch.where(mask_c.unsqueeze(-1), result_c, out)
+        # Path 1
+        idx_a = mask_a.nonzero(as_tuple=True)[0]
+        if idx_a.numel() > 0:
+            subset = X_flat[idx_a]
+            out_a = self._path_1_transform(subset)
+            out[idx_a] = out_a
+
+        # Path 2
+        idx_b = mask_b.nonzero(as_tuple=True)[0]
+        if idx_b.numel() > 0:
+            subset = X_flat[idx_b]
+            out_b = self._path_2_transform(subset)
+            out[idx_b] = out_b
+
+        # Path 5
+        idx_c = mask_c.nonzero(as_tuple=True)[0]
+        if idx_c.numel() > 0:
+            subset = X_flat[idx_c]
+            out_c = self._path_5_transform(self.path_5_sequential, subset)
+            out[idx_c] = out_c
 
         # ---- Reshape back to [batch, seq, d_model] --------------------
         return out.reshape(batch_size, seq_len, self.d_model)

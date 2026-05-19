@@ -114,37 +114,13 @@ class PlanckXCharModel(nn.Module):
         embedded = self.token_embedding(input_ids)        # [B, S-1, D]
         flat_embed = embedded.reshape(-1, self.d_model)   # [N, D]
 
-        # ------------------------------------------------------------------
-        # Preliminary pass — all tokens conservatively on Path 5 to produce
-        # entropy from the SAME output_projection weights the CE loss uses.
-        # ------------------------------------------------------------------
-        conservative_flat = self.plankx_layer(
-            flat_embed.reshape(embedded.shape),            # [B,S-1,D]
-            entropy_logits=None,
-        )
-        rough_logits = self.output_projection(conservative_flat)   # [B,S-1,V]
-
-        # ------------------------------------------------------------------
-        # Compute per-token entropy from those actual output logits.
-        # torch.no_grad is fine — these logits ARE the ones that will
-        # produce the routing entropy, and the loss that flows through
-        # output_projection will be entirely determined by the second pass.
-        # ------------------------------------------------------------------
-        with torch.no_grad():
-            flat_logits = rough_logits.reshape(-1, rough_logits.shape[-1])
-            probs = F.softmax(flat_logits, dim=-1)
-            log_p = torch.log2(probs + 1e-9)
-            token_H = -(probs * log_p).sum(dim=-1)         # [N]
-
-        # ------------------------------------------------------------------
-        # Second pass — route using the actual model-output entropy as gate.
-        # entropy_logits must be flat [N, V] to match X.flat's first dim.
-        # ------------------------------------------------------------------
+        # Single-pass routing: use the router's lightweight routing_head to
+        # compute routing entropy and dispatch tokens. This avoids a
+        # preliminary full Path-5 execution and ensures unused branches
+        # never execute.
         routed_flat = self.plankx_layer(
             flat_embed.reshape(embedded.shape),           # [B, S-1, D]
-            entropy_logits=rough_logits.reshape(          # [B*(S-1), V]
-                -1, rough_logits.shape[-1]
-            ),
+            entropy_logits=None,
         )
         logits = self.output_projection(routed_flat)
         return logits
